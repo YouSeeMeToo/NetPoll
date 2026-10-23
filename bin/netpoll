@@ -1,0 +1,1150 @@
+#!/usr/bin/perl
+
+###############################################################################
+#
+# Network Ping Poller
+#
+# This script is designed to ping a large number of IPs in a set time interval,
+# and generate SNMP traps when the up/down status of an IP changes. All
+# configuration and runtime data is stored in a SQLite database. The script
+# should be run from cron every 5 minutes.
+#
+# Run the command "netpoll help" for command line help.
+#
+# Architecture overview:
+#
+# The script operates in one of two modes:
+#
+# 1. Poll mode (no command-line arguments):
+#    The script polls all configured devices in parallel using Perl ithreads.
+#    Device IPs are read from the database by a reader thread, distributed to
+#    N worker threads (poll_slaves) via a shared queue, pinged via ICMP, and
+#    the results are written back to the database by a writer thread. SNMP
+#    traps are generated for any device whose status changed (up->down or
+#    down->up) since the last poll. A heartbeat trap is sent at the end.
+#
+# 2. Management mode (with command-line arguments):
+#    Performs a single administrative operation (add/drop devices, manage
+#    NBIs, set customer, backup/restore config, display status) and exits.
+#
+# Thread coordination uses two queues and four semaphores:
+#   - device_unknown: reader -> pollers (devices to ping)
+#   - device_known:   pollers -> writer (results to persist)
+#   - queue_limit:    bounds pending devices to prevent memory exhaustion
+#   - trap_limit:     limits concurrent snmptrap invocations to 2
+#   - start_polling:  signals when the reader has begun enqueueing
+#   - stop_polling:   signals when all devices are queued (pollers can stop)
+#
+# The SQLite database uses per-host table naming (e.g., devices_<hostname>)
+# so multiple pollinng hosts can share a single database file (requires a
+# shared filesystem such as NFS). WAL mode is enabled for concurrent
+# read/write access across threads.
+#
+# Worker thread scaling:
+#   The number of poller threads is calculated as ceil(device_total / 70).
+#   The divisor of 70 is derived from the worst-case per-device ping time:
+#   each poll_slave attempts 3 pings — two at 1-second timeout and one at
+#   2-second timeout — giving a worst-case of ~4 seconds per device.
+#   At 70 devices/thread × 4 seconds = 280 seconds (~4.7 minutes), which
+#   fits within the 5-minute (300-second) cron interval with ~20 seconds
+#   of margin for overhead, trap generation, and DB writes. Even if the
+#   entire device list is unreachable (worst case), all threads will finish
+#   before the next cron invocation starts.
+#
+#		v 1.0	2012-05-30	Ulysses Cruz
+#		v 1.1	2012-06-01	Ulysses Cruz	Adapted to work with addsourceip script
+#		v 1.2	2012-06-08	Ulysses Cruz	Added status reporting functionality
+#		v 1.3	2012-06-14	Ulysses Cruz	Added NBI configuration into db
+#		v 2.0	2012-06-19	Ulysses Cruz	Added multi-host shared configuration capability, Configuration can now be backed up and restored. New script locking mechanism in place allowing finer control. Added function to automatically upgrade old v1.x configuration.
+#		v 2.1	2012-07-06	Ulysses Cruz	Added thread limiting to avoid crashes on extremely large device lists, and mysql queueing to prevent update failures.
+#		v 3.0	2012-07-16	Ulysses Cruz	Re-implemented in perl script to improve performance.
+#		v 4.0	2026-10-22	Ulysses Cruz	Ported from MySQL to SQLite for portability (no external database server required).
+#
+# �2012-2026 Ulysses Cruz
+###############################################################################
+
+$| = 1; # force buffer flush on each write (unbuffered output for real-time logging)
+
+my $debug = 0; # turn on debugging (set to 1 for verbose output)
+
+use Config;
+$Config{useithreads} or die('Recompile Perl with threads to run this program.');
+
+use threads; # activate thread support (required for parallel ICMP polling)
+use threads::shared; # allow shared data between threads (synchronizes variables across ithreads)
+use Thread::Queue; # shared queue support (thread-safe FIFO for inter-thread communication)
+use Thread::Semaphore; # process control semaphores (counting semaphores for resource limiting)
+use POSIX qw(strftime); # allow for easy format of timestamps (strftime for ISO 8601 date/time)
+use POSIX qw(nice); # allow the process to run 'nice' lowering scheduling priority
+use Fcntl qw(:flock); # import the LOCK_?? flock constants (LOCK_EX, LOCK_NB for file locking)
+use File::Basename qw(dirname); # extract directory from a file path (for DB dir creation)
+use File::Path qw(make_path); # create directory trees recursively (ensure DB dir exists)
+use strict; # enable run-time error checking (catches undeclared variables, typos)
+use warnings; # enable run-time warnings (catches potential issues like unused vars)
+
+################################################################################
+#
+# Global configuration
+#
+# These globals are accessible by all subroutines. Shared variables are
+# marked with share() so that values written in one ithread are visible in
+# others. Regular (non-shared) variables are copied per-thread at thread
+# creation time and are NOT synchronized.
+#
+################################################################################
+
+# System hostname — used for per-host table naming in the database
+# and for SNMP trap source identification
+my $hostname = `hostname`; chomp($hostname);
+
+# Software version — displayed in help and SNMP trap descriptions
+my $version  = '4.0';
+
+# Script name (basename of $0) — used for lockfile naming and syslog tags
+my $script = `basename $0`; chomp($script);
+
+# SQLite database file path.
+# Override with the NETPOLL_DB environment variable (useful for testing
+# or non-standard installs). Defaults to /var/lib/netpoll/netpoll.db.
+my $db_file = $ENV{NETPOLL_DB} || '/var/lib/netpoll/netpoll.db';
+
+# Ensure the database directory exists before any thread tries to connect.
+# SQLite creates the database file automatically, but the parent directory
+# must already exist.
+my $db_dir = dirname($db_file);
+if (!-d $db_dir) {
+	make_path($db_dir) or die("Unable to create database directory $db_dir: $!");
+}
+
+# Shared variables — visible across all threads
+# @NBIS: list of NBI (trap destination) IP addresses, loaded from the database
+my @NBIS; share(@NBIS);
+
+# $CUSTOMER: the SNMP community string for trap generation, loaded from the
+# database on startup. Defaults to 'changeme' in the database until set.
+my $CUSTOMER; share($CUSTOMER);
+
+# Timestamps for the current polling session
+my $start_time = strftime("%F %T", localtime); # set once at script start
+my $finish_time; # set when the poll completes
+
+# Total number of devices to poll (loaded from database, shared with poll_master
+# so it can calculate the number of worker threads to spawn)
+my $device_total; share($device_total);
+
+# Maximum number of worker threads — derived from the kernel's thread limit.
+# This prevents spawning too many ICMP pingers and exhausting system resources.
+# The divisor (128) is a heuristic: on most systems this yields a safe upper
+# bound for concurrent ping threads.
+my $global_thread_limit = int(`cat /proc/sys/kernel/threads-max` / 128);
+
+# ---------------------------------------------------------------------------
+# Thread-safe data structures
+# ---------------------------------------------------------------------------
+
+# Two queues for passing device data between threads:
+# $device_unknown: reader thread -> poller threads (devices to poll)
+# $device_known:   poller threads -> writer thread (poll results to persist)
+my $device_known = Thread::Queue->new();
+my $device_unknown = Thread::Queue->new();
+
+# Semaphores for thread coordination:
+# $trap_limit: limits concurrent snmptrap invocations to 2 (avoids spwaning
+#   too many external processes simultaneously)
+my $trap_limit = Thread::Semaphore->new(2);
+
+# $queue_limit: bounds the number of devices queued for polling. This prevents
+#   the reader from enqueueing thousands of devices into memory at once,
+#   which could cause memory exhaustion on large device lists. Each poll_slave
+#   calls ->up() (increment) after dequeuing a device, and the reader calls
+#   ->down() (decrement) before enqueueing.
+my $queue_limit = Thread::Semaphore->new($global_thread_limit);
+
+# $start_polling: signaled by the reader when it begins enqueueing devices.
+#   The poll_master waits on this before spawning poller threads.
+my $start_polling = Thread::Semaphore->new(0);
+
+# $stop_polling: signaled by the reader when it finishes enqueueing all devices.
+#   The poll_master waits on this before sending END sentinels to the pollers.
+my $stop_polling = Thread::Semaphore->new(0);
+
+################################################################################
+#
+# Main routine
+#
+################################################################################
+
+# Run at low scheduling priority so the poller doesn't interfere with
+# interactive work on the host
+nice(2); # raise the process nice value
+
+# Shared option variables — populated by get_opts() in a child thread.
+# Each is initialized to 0 so the main thread can check truthiness
+# after get_opts() returns.
+my $add = 0; share($add);
+my $drop = 0; share($drop);
+my $listadd = 0; share($listadd);
+my $listdrop = 0; share($listdrop);
+my $nbiadd = 0; share($nbiadd);
+my $nbidrop = 0; share($nbidrop);
+my $customer = 0; share($customer);
+my $hostupdate = 0; share($hostupdate);
+my $hostdelete = 0; share($hostdelete);
+my $status = 0; share($status);
+my $backup = 0; share($backup);
+my $restore = 0; share($restore);
+
+# Lockfile prevents overlapping poll runs. Uses flock for atomic locking.
+# Path: /var/lock/netpoll_<hostname>
+my $lockfile = "/var/lock/" . $script . "_" . $hostname;
+my @device_info;
+
+if ( @ARGV > 0 ) { # A command line option has been set — management mode
+	# Parse command-line options in a child thread. The shared variables
+	# declared above are set by GetOptions() in the child thread, and their
+	# values are visible here after join().
+	my $opts_thread = threads->create(\&get_opts);
+	$opts_thread->join();
+
+	# Process options — each branch performs a single management operation
+	if ( $hostupdate ) {
+		# Rename an old host's configuration to the current hostname.
+		# This is useful when the monitoring host is renamed — existing
+		# database tables and script entries are updated accordingly.
+		print("Updating old host $hostupdate to $hostname in config.\n");
+		open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+		flock(LOCKFILE, LOCK_EX) or &log_exit("Exiting: poller session already running!");
+		&database_interface('host_update', $hostupdate);
+	} elsif ( $hostdelete ) {
+		# Remove a host's configuration entirely — deletes its script
+		# entry and drops its nbis_ and devices_ tables.
+		print("Deleting host $hostdelete from config.\n");
+		open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+		flock(LOCKFILE, LOCK_EX) or &log_exit("Exiting: poller session already running!");
+		&database_interface('host_delete', $hostdelete);
+	} elsif ( $nbiadd ) {
+		# Add an NBI (trap destination) IP for this host. No lockfile needed
+		# since this is a single-row insert.
+		print("Adding NBI $nbiadd\n") if ($debug);
+		&database_interface('nbi_add', $nbiadd);
+	} elsif ( $nbidrop ) {
+		# Remove an NBI destination for this host.
+		print("Dropping NBI $nbidrop\n") if ($debug);
+		open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+		flock(LOCKFILE, LOCK_EX) or &log_exit("Exiting: poller session already running!");
+		&database_interface('nbi_drop', $nbidrop);
+	} elsif ( $customer ) {
+		# Set the SNMP community string. This is required — the script
+		# aborts with help text if the customer is still 'changeme'.
+		print("Setting customer to $customer\n") if ($debug);
+		&database_interface('customer', $customer);
+	} elsif ( $add ) {
+		# Add one or more IPs from the command-line argument. The argument
+		# is regex-scanned for dotted-quad patterns, allowing multiple IPs
+		# to be passed in a single argument or comma-separated.
+		my $db_thread = threads->create(\&database_interface,'device_add',0);
+		while ($add =~ m/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g) {
+			print("Adding device $1\n");
+			@device_info=($start_time, 'unknown', $start_time, $1);
+			$device_unknown->enqueue(\@device_info);
+		}
+		$device_unknown->enqueue('END'); # sentinel signals end of device list
+		$db_thread->join();
+	} elsif ( $drop ) {
+		# Remove one or more IPs from the database. Requires a lockfile to
+		# prevent concurrent modifications.
+		open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+		flock(LOCKFILE, LOCK_EX) or &log_exit("Exiting: poller session already running!");
+		my $db_thread = threads->create(\&database_interface,'device_drop',0);
+		while ($drop =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g) {
+			print("Dropping device $1\n");
+			@device_info=($start_time, 'unknown', $start_time, $1);
+			$device_unknown->enqueue(\@device_info);
+		}
+		$device_unknown->enqueue('END');
+		$db_thread->join();
+	} elsif ( $listadd ) {
+		# Add devices from a file — each line is scanned for IP addresses.
+		my $db_thread = threads->create(\&database_interface,'device_add',0);
+		foreach my $line (<DATA>) {
+			while ($line =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g) {
+				print("Adding device $1\n");
+				@device_info=($start_time, 'unknown', $start_time, $1);
+				$device_unknown->enqueue(\@device_info);
+			}
+		}
+		$device_unknown->enqueue('END');
+		$db_thread->join();
+	} elsif ( $listdrop ) {
+		# Remove devices listed in a file. Requires lockfile for safety.
+		open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+		flock(LOCKFILE, LOCK_EX) or &log_exit("Exiting: poller session already running!");
+		open(DATA, $listdrop) || die("Could not open file $listdrop");
+		my $db_thread = threads->create(\&database_interface,'device_drop',0);
+		foreach my $line (<DATA>) {
+			while ($line =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g) {
+				print("Dropping device $1\n");
+				@device_info=($start_time, 'unknown', $start_time, $1);
+				$device_unknown->enqueue(\@device_info);
+			}
+		}
+		$device_unknown->enqueue('END');
+		$db_thread->join();
+	} elsif ( $backup ) {
+		# Use SQLite's online .backup command — safe to run while the
+		# database is in use (handles file locking internally).
+		print("Backing up the configuration to $backup\n");
+		`sqlite3 $db_file ".backup $backup"`;
+	} elsif ( $restore ) {
+		# Use SQLite's .restore command — replaces database contents.
+		# WARNING: this overwrites all current configuration data.
+		print("Restoring configuration from $restore\n");
+		`sqlite3 $db_file ".restore $restore"`;
+	} elsif ( $status ) {
+		# Status reporting — four sub-modes:
+		#   devices   — table of all devices, sorted by last status change
+		#   poller    — poller process metadata, NBI list, device count
+		#   resend    — re-send all device statuses as SNMP traps
+		#   <search>  — status of devices matching a LIKE pattern (% for wildcard)
+		if ($status eq 'devices') {
+			# Load global config (customer, NBIs, device count) needed for display
+			&database_interface('global');
+			print("Current status of all monitored devices:\n");
+			my $format='| %4$-15s | %1$-19s | %2$-7s | %3$-19s |' . "\n";
+			print("+-----------------+---------------------+---------+---------------------+\n");
+			printf($format,'LAST POLL','STATUS','LAST CHANGED','IP');
+			print("+-----------------+---------------------+---------+---------------------+\n");
+			# Spawn a thread to query the database; results come back via
+			# the device_unknown queue
+			my $list_devices = threads->create(\&database_interface,'device_stat');
+			while (my $device_ref = $device_unknown->dequeue()) {
+				last if ($device_ref eq 'END');
+				my @device_info = @$device_ref;
+				# Replace empty values with 'NULL' for display
+				for (my $count = 0 ; $count <= 4 ; $count++) {
+					$device_info[$count] = 'NULL' unless ($device_info[$count])
+				}
+				printf($format,@device_info);
+				$queue_limit->up(); # release the queue slot taken by the reader
+			}
+			print("+-----------------+---------------------+---------+---------------------+\n");
+		} elsif ($status eq 'poller') {
+			print("\nCurrent status of the poller(s):\n\n");
+			my $list_devices = threads->create(\&database_interface,'host_list');
+			print("+----------------------+----------------------+---------------------+---------------------+---------------------+\n");
+			my $format="| %-20s | %-19s | %-19s | %-19s | %-19s |\n";
+			printf($format,'POLLER','CUSTOMER','LAST POLL START','LAST POLL END','CURRENT POLL START');
+			print("+----------------------+----------------------+---------------------+---------------------+---------------------+\n");
+			while (my $device_ref = $device_unknown->dequeue()) {
+				last if ($device_ref eq 'END');
+				my @device_info = @$device_ref;
+				for (my $count = 0 ; $count <= 4 ; $count++) {
+					$device_info[$count] = 'NULL' unless ($device_info[$count])
+				}
+				printf($format,@device_info);
+				$queue_limit->up();
+			}
+			print("+----------------------+----------------------+---------------------+---------------------+---------------------+\n");
+			print("\nNBIs for host $hostname:\n");
+			foreach my $nbi (@NBIS) {
+				print("$nbi\n");
+			}
+			print("\nNumber of devices polled: $device_total\n\n");
+		} elsif ($status eq 'resend') {
+			# Re-transmit the current status of every device as an SNMP trap.
+			# This is useful for testing trap delivery or re-syncing after
+			# an NBI has been restarted.
+			print("Resending all devices status\n");
+			&database_interface('global');
+			my $list_devices = threads->create(\&database_interface,'device_list');
+			while (my $device_ref = $device_unknown->dequeue()) {
+				last if ($device_ref eq 'END');
+				my ($last_poll, $last_stat, $last_chng, $ip) = @$device_ref;
+				my $curr = strftime("%F %T", localtime);
+				print("Device $ip last status: $last_stat\n");
+				if ($last_stat eq 'down') {
+					print("Node down: $ip\n");
+					&send_trap($ip, $last_stat, $curr);
+				} elsif ($last_stat eq 'up') {
+					print("Node up: $ip\n");
+					&send_trap($ip, $last_stat, $curr);
+				}
+				$queue_limit->up();
+			}
+		} else {
+			# Search for a specific device by IP (use % as wildcard instead of *)
+			print("Checking the status of device $status:\n\n");
+			my $format='| %4$-15s | %1$-19s | %2$-7s | %3$-19s |' . "\n";
+			print("+-----------------+---------------------+---------+---------------------+\n");
+			printf($format,'LAST POLL','STATUS','LAST CHANGED','IP');
+			print("+-----------------+---------------------+---------+---------------------+\n");
+			my $list_devices = threads->create(\&database_interface,'device_search',$status);
+			while (my $device_ref = $device_unknown->dequeue()) {
+				last if ($device_ref eq 'END');
+				my @device_info = @$device_ref;
+				for (my $count = 0 ; $count <= 4 ; $count++) {
+					$device_info[$count] = 'NULL' unless ($device_info[$count])
+				}
+				printf($format,@device_info);
+			}
+			print("+-----------------+---------------------+---------+---------------------+\n");
+		}
+	}
+} else { # No options set — run a poll!
+
+	print("Starting netpoll\n");
+	print("Running poll!\n") if ($debug);
+
+	# Load global configuration (customer, NBIs, device count) before
+	# acquiring the lock — this ensures abort conditions are detected
+	# before we claim the run.
+	my $get_global = threads->new(\&database_interface,'global');
+	$get_global->join();
+
+	# Acquire exclusive lock (non-blocking). If another instance is
+	# already running, exit immediately.
+	open(LOCKFILE, ">>$lockfile") or &log_exit("Unable to open lockfile $lockfile");
+	flock(LOCKFILE, LOCK_EX | LOCK_NB) or &log_exit("Exiting: poller session already running!");
+
+	# Record start time for runtime measurement
+	my $start_sec = strftime("%s", localtime);
+
+	# Spawn the poll master thread, which coordinates all worker threads
+	my $poll_thread = threads->create(\&poll_master);
+	print("Starting database threads") if ($debug);
+
+	# Spawn the database interface thread in 'poll' mode — this function
+	# starts the reader and writer sub-threads, waits for them to complete,
+	# then records poll-end timestamps.
+	my $db_thread = threads->create(\&database_interface,'poll',0);
+
+	# Wait for both the poll master and database interface to finish
+	foreach my $poll_threads ($db_thread, $poll_thread) {
+		$poll_threads->join();
+	}
+
+	# Record finish time and calculate runtime
+	my $stop_sec = strftime("%s", localtime);
+	$finish_time = strftime("%F %T", localtime);
+	my $run_time = $stop_sec - $start_sec;
+
+	# Send heartbeat trap to indicate the poller is alive
+	&send_heartbeat;
+	&log_only("Poll complete in $run_time seconds. Poller is alive.");
+
+	close(LOCKFILE);
+}
+
+# Wait for all remaining threads to finish processing before exiting.
+# This ensures no background operations are left dangling.
+foreach my $threads (threads->list()) {
+	$threads->join();
+}
+
+exit(0);
+
+
+################################################################################
+#
+# Subroutines
+#
+################################################################################
+
+# SQLite connection helper — sets WAL mode and busy timeout for concurrency.
+#
+# Each thread that needs database access calls this function to create its own
+# DBI connection. WAL (Write-Ahead Logging) mode allows concurrent readers
+# while a writer is active, which is critical because the database_reader and
+# database_writer threads run simultaneously during polling. The busy_timeout
+# of 5 seconds causes SQLite to automatically retry if another writer holds
+# the lock, rather than immediately failing with "database is locked".
+sub sqlite_connect () {
+	require DBI;
+	import DBI;
+
+	# DBI->connect for SQLite uses an empty username and password.
+	# RaiseError => 1: die on SQL errors (caught by surrounding code)
+	# PrintError => 0: suppress DBI's automatic STDERR messages (we log to syslog)
+	my $DB = DBI->connect("dbi:SQLite:dbname=$db_file","","", { RaiseError => 1, PrintError => 0 });
+	unless ($DB) { &log_exit("Failed to connect to database: " . DBI->errstr . "\n"); }
+	$DB->do('PRAGMA journal_mode = WAL');
+	$DB->do('PRAGMA synchronous = NORMAL'); # good balance of speed and durability in WAL mode
+	$DB->do('PRAGMA busy_timeout = 5000');  # wait up to 5s if another writer is active
+	return $DB;
+}
+
+# Database Interface subroutine
+#
+# This is the central dispatch for all database operations. It is designed to
+# run as a ithread (in some cases) so that database access (which involves
+# blocking I/O) doesn't stall the main thread. Each invocation:
+#   1. Opens a fresh SQLite connection (via sqlite_connect)
+#   2. Ensures the per-host tables exist (CREATE TABLE IF NOT EXISTS)
+#   3. Prepares all SQL statements needed for the requested function
+#   4. Executes the function-specific logic
+#   5. Cleans up statement handles and disconnects
+#
+# The 'poll' function is special: it spawns the database_reader and
+# database_writer threads as sub-threads, which share the same database
+# file (each with its own connection).
+sub database_interface () {
+
+	# The DBI module is restricted to this subroutine to reduce memory
+	# utilization in the overall process — Perl ithreads copy the entire
+	# interpreter, so loading heavy modules only in threads that need them
+	# keeps the memory footprint lower for threads that don't (e.g. poll_slaves).
+	require DBI;
+	import DBI;
+
+	my $function = $_[0];    # which operation to perform
+	my $optional = $_[1];    # optional argument (IP, filename, etc.)
+	my $device_ref;
+	my @device_info;
+
+	print("Starting database interface with function $function\n") if ($debug);
+
+	# Open netpoll database (SQLite creates the file automatically on connect)
+	my $DB = &sqlite_connect;
+
+	# Create tables if they don't exist.
+	# The script table holds per-host metadata (customer, poll timestamps).
+	# The nbis_$hostname table holds trap destination IPs.
+	# The devices_$hostname table holds the monitored device list and status.
+	# Table names include $hostname so multiple hosts can share one database.
+	$DB->do("create table if not exists script (
+		server		varchar(128) UNIQUE default '$hostname',
+		customer	varchar(128) default 'changeme',
+		last_start	datetime,
+		last_end	datetime,
+		cur_start	datetime)");
+	$DB->do("create table if not exists nbis_$hostname (
+		ip		varchar(20) UNIQUE)");
+	$DB->do("create table if not exists devices_$hostname (
+		ip			varchar(20) UNIQUE,
+		last_poll	datetime,
+		last_stat	varchar(50) default 'unknown',
+		last_chng	datetime,
+		count		int default 0,
+		priority	int default 0,
+		special1	varchar(128),
+		special2	int default 0)");
+
+	# Prepare all SQL statements up front for efficiency. Prepared statements
+	# are reused across multiple execute() calls within this invocation.
+	my $sql_host_count = $DB->prepare("select count(*) from script where server=?");
+	my $sql_host_add = $DB->prepare("insert or ignore into script (server) values(?)");
+	my $sql_host_start = $DB->prepare("update script set cur_start=? where server='$hostname'");
+	my $sql_host_finish = $DB->prepare("update script set last_start=?,last_end=?,cur_start=NULL where server='$hostname'");
+	my $sql_host_status = $DB->prepare("select * from script");
+	my $sql_customer_get = $DB->prepare("select customer from script where server='$hostname'");
+	my $sql_customer_set = $DB->prepare("update script set customer=? where server='$hostname'");
+	my $sql_nbi_add = $DB->prepare("insert or ignore into nbis_$hostname (ip) values (?)");
+	my $sql_nbi_drop = $DB->prepare("delete from nbis_$hostname where ip=?");
+	my $sql_nbi_query = $DB->prepare("select ip from nbis_$hostname");
+	my $sql_device_add = $DB->prepare("insert or ignore into devices_$hostname (ip) values (?)");
+	my $sql_device_drop = $DB->prepare("delete from devices_$hostname where ip=?");
+	my $sql_device_query = $DB->prepare("select last_poll,last_stat,last_chng,ip from devices_$hostname where ip like ?");
+	my $sql_device_count = $DB->prepare("select count(*) from devices_$hostname");
+	my $sql_device_status = $DB->prepare("select last_poll,last_stat,last_chng,ip from devices_$hostname order by last_chng asc");
+
+	# Make sure the current host is in the database (insert if not exists)
+	$sql_host_add->execute($hostname);
+	# Determine what database operations to perform based on indicated function
+	if ( $function eq 'nbi_add' ) { # Add NBI to table for this host
+		$sql_nbi_add->execute($optional);
+		print("Added NBI $optional\n") if ($debug);
+	} elsif ( $function eq 'nbi_drop' ) { # Drop NBI for this host
+		$sql_nbi_drop->execute($optional);
+		print("Dropped NBI $optional\n") if ($debug);
+	} elsif ( $function eq 'customer' ) { # Change the customer name for this host
+		$sql_customer_set->execute($optional);
+		print("Set customer to $optional\n") if ($debug);
+	} elsif ( $function eq 'device_add' ) { # Add one or more devices to the polling list
+		while ($device_ref = $device_unknown->dequeue()) {
+			last if ($device_ref eq 'END');
+			@device_info = @$device_ref;
+			$sql_device_add->execute($device_info[3]);
+			print("Added device $device_info[3]\n") if ($debug);
+		}
+	} elsif ( $function eq 'device_drop' ) { # Drop one or more devices from the polling queue
+		while ($device_ref = $device_unknown->dequeue()) {
+			last if ($device_ref eq 'END');
+			@device_info = @$device_ref;
+			$sql_device_drop->execute($device_info[3]);
+			print("Dropped device $device_info[3]\n") if ($debug);
+		}
+	} elsif ( $function eq 'device_list' ) { # Just list the current status of all devices
+		my $db_reader = threads->create(\&database_reader);
+		$db_reader->join();
+	} elsif ( $function eq 'device_stat' ) { # Return the current status of all devices sorted by change time
+		$sql_device_status->execute();
+		while (my @device_info = $sql_device_status->fetchrow_array()) {
+			$device_unknown->enqueue(\@device_info);
+		}
+		$device_unknown->enqueue('END');
+	} elsif ( $function eq 'device_search' ) { # Get the status of only a few devices
+		$sql_device_query->execute($optional);
+		while (@device_info = $sql_device_query->fetchrow_array()) {
+			$device_unknown->enqueue(\@device_info);
+		}
+		$device_unknown->enqueue('END');
+	} elsif ( $function eq 'host_list') { # List the status information of the poll script
+		$sql_device_count->execute();
+		$device_total=$sql_device_count->fetchrow_array();
+		$sql_nbi_query->execute();
+		while (my $nbi = $sql_nbi_query->fetchrow_array()) {
+			push(@NBIS,$nbi);
+			print("Loaded NBI $nbi\n") if ($debug);
+		}
+		$sql_host_status->execute();
+		while (my @host = $sql_host_status->fetchrow_array()) {
+			$device_unknown->enqueue(\@host);
+		}
+		$device_unknown->enqueue('END');
+	} elsif ( $function eq 'global') { # Load global variables
+		# Load the customer (SNMP community), device count, and NBI list
+		# into shared variables so all threads can access them.
+		$sql_customer_get->execute();
+		$CUSTOMER = $sql_customer_get->fetchrow_array();
+		$sql_device_count->execute();
+		$device_total=$sql_device_count->fetchrow_array();
+		$sql_nbi_query->execute();
+		# Abort if customer has not been set — traps can't be sent without
+		# a community string.
+		if ($CUSTOMER eq 'changeme') {
+			$device_unknown->enqueue('END');
+			&show_help();
+			&log_exit("No customer set, aborting session!");
+		}
+		while (my $nbi = $sql_nbi_query->fetchrow_array()) {
+			push(@NBIS,$nbi);
+			print("Loaded NBI $nbi\n") if ($debug);
+		}
+	} elsif ( $function eq 'host_update' ) {
+		# Rename tables from an old hostname to the current hostname.
+		# This handles host renames by: deleting the current host entry,
+		# dropping current host tables, renaming old host's tables, and
+		# updating the script table entry.
+		$sql_host_count->execute($optional);
+		if (my $count = $sql_host_count->fetchrow_array()) {
+			$DB->do("delete from script where server='$hostname'");
+			$DB->do("drop table nbis_$hostname");
+			$DB->do("drop table devices_$hostname");
+			$DB->do("update script set server='$hostname' where server='$optional'");
+			$DB->do("alter table nbis_$optional rename to nbis_$hostname");
+			$DB->do("alter table devices_$optional rename to devices_$hostname");
+		} else {
+			print("Host $optional does not exist in the config!\n");
+		}
+	} elsif ( $function eq 'host_delete' ) {
+		# Completely remove a host's configuration — script entry, NBI
+		# table, and device table are all dropped.
+		$sql_host_count->execute($optional);
+		if (my $count = $sql_host_count->fetchrow_array()) {
+			$DB->do("delete from script where server='$optional'");
+			$DB->do("drop table nbis_$optional");
+			$DB->do("drop table devices_$optional");
+		} else {
+			print("Host $optional does not exist in the config!\n");
+		}
+	} elsif ( $function eq 'poll') { # Setup for polling operations
+		# Record the start of this polling session
+		$sql_host_start->execute($start_time);
+
+		# Start database read/write threads
+		print("Starting device reader and writer\n") if ($debug);
+		my $db_writer = threads->create(\&database_writer);
+		my $db_reader = threads->create(\&database_reader);
+
+		# Wait for all threads to finish processing
+		foreach my $threads ($db_reader,$db_writer) {
+			$threads->join();
+		}
+
+		# Record the end of this polling session
+		$sql_host_finish->execute($start_time,strftime("%F %T", localtime));
+	}
+
+	# Clean up the database connections before exiting
+	$sql_host_count = undef;
+	$sql_host_add = undef;
+	$sql_host_start = undef;
+	$sql_host_finish = undef;
+	$sql_host_status = undef;
+	$sql_customer_get = undef;
+	$sql_customer_set = undef;
+	$sql_nbi_add = undef;
+	$sql_nbi_drop = undef;
+	$sql_nbi_query = undef;
+	$sql_device_add = undef;
+	$sql_device_drop = undef;
+	$sql_device_query = undef;
+	$sql_device_count = undef;
+	$sql_device_status = undef;
+
+	$DB->disconnect;
+
+	print("Stopped database interface.\n") if ($debug);
+
+}
+
+# Start database reader
+#
+# This thread reads all configured devices from the database and enqueues
+# them into the $device_unknown queue for the poll_slave threads to process.
+# It signals $start_polling when it begins, and $stop_polling when it
+# finishes, allowing the poll_master to coordinate the worker lifecycle.
+#
+# The queue_limit semaphore is decremented (down) for each device enqueued,
+# preventing the queue from growing unboundedly (the poll_slaves call ->up
+# to release slots as they consume devices).
+sub database_reader () {
+	# The DBI module is restricted to this subroutine to reduce memory utilization in the overall process
+	require DBI;
+	import DBI;
+
+	# Clear all option flags — these are only relevant in the main thread
+	# during option parsing. Worker threads should not carry stale values.
+	undef($add);
+	undef($drop);
+	undef($listadd);
+	undef($listdrop);
+	undef($nbiadd);
+	undef($nbidrop);
+	undef($customer);
+	undef($hostupdate);
+	undef($hostdelete);
+	undef($status);
+	undef($backup);
+	undef($restore);
+
+	my $device_ref;
+	my @device_info;
+
+	print("Starting database reader.\n") if ($debug);
+
+	# Open Database
+	my $DB = &sqlite_connect;
+
+	# Prepare database commands
+	# Select devices ordered by last_stat so that 'down' devices are polled
+	# first (prioritizing recovery detection). The 'order by last_stat asc'
+	# puts 'down' before 'unknown' before 'up' alphabetically.
+	my $sql_device_list = $DB->prepare("select last_poll,last_stat,last_chng,ip from devices_$hostname order by last_stat asc");
+
+	$sql_device_list->execute();
+	$start_polling->up(); # signal poll_master that reader has started
+
+	while (@device_info = $sql_device_list->fetchrow_array()) {
+		$queue_limit->down(); # acquire a queue slot (blocks if queue is full)
+		$device_unknown->enqueue(\@device_info);
+	}
+	$device_unknown->enqueue('END'); # sentinel: no more devices
+
+	$stop_polling->up(); # signal poll_master that all devices are queued
+
+	$DB->disconnect;
+
+	print("Stopped database reader.\n") if ($debug);
+
+}
+
+# Start database writer
+#
+# This thread consumes results from the $device_known queue (populated by
+# poll_slave threads) and writes them to the devices_$hostname table.
+# Each result is a 4-element array: (last_poll, last_stat, last_chng, ip).
+# The writer runs until it dequeues the 'END' sentinel.
+sub database_writer () {
+	# The DBI module is restricted to this subroutine to reduce memory utilization in the overall process
+	require DBI;
+	import DBI;
+
+	# Clear option flags from parent thread (same rationale as database_reader)
+	undef($add);
+	undef($drop);
+	undef($listadd);
+	undef($listdrop);
+	undef($nbiadd);
+	undef($nbidrop);
+	undef($customer);
+	undef($hostupdate);
+	undef($hostdelete);
+	undef($status);
+	undef($backup);
+	undef($restore);
+
+	my $device_ref;
+	my @device_info;
+
+	print("Starting database writer.\n") if ($debug);
+
+	# Open Database
+	my $DB = &sqlite_connect;
+
+	# Prepare database commands — batch update of poll results
+	my $sql_device_update = $DB->prepare("update devices_$hostname set last_poll=?,last_stat=?,last_chng=? where ip=?");
+
+	while ($device_ref = $device_known->dequeue()) {
+		last if ($device_ref eq 'END');
+		@device_info = @$device_ref;
+		$sql_device_update->execute(@device_info);
+	}
+
+	$DB->disconnect;
+
+	print("Stopped database writer.\n") if ($debug);
+
+}
+
+# Polling control master
+#
+# This thread orchestrates the parallel ping workers. The flow is:
+#   1. Wait for $start_polling (reader has begun loading devices)
+#   2. Spin-wait until at least one device is in the queue
+#   3. Calculate the number of worker threads based on device count
+#      (ceil(device_total / 70), capped at $global_thread_limit)
+#   4. Spawn $poller_limit poll_slave threads
+#   5. Wait for $stop_polling (reader has finished loading all devices)
+#   6. Send 'END' sentinel to each poller (one per worker)
+#   7. Join all worker threads
+#   8. Send 'END' sentinel to the writer thread (no more results)
+#
+# The '70' divisor is calibrated to the worst-case per-device ping time:
+#   - Net::Ping timeout is 1 second for the first two attempts and 2 seconds
+#     for the third (total ~4 seconds per device when all pings time out).
+#   - 70 devices × 4 seconds = 280 seconds (~4.7 min), which leaves ~20 seconds
+#     of margin within the 5-minute (300s) cron interval for trap generation,
+#     DB writes, and other overhead.
+#   - 'int(device_total / 70) + 1' rounds up so partial groups get their own
+#     thread (e.g., 71 devices → 2 threads, not 1).
+#   - This ensures the entire poll completes within the cron interval even in
+#     the worst case (all devices unreachable, every ping timing out).
+sub poll_master () {
+
+	# Clear option flags in this worker thread
+	undef($add);
+	undef($drop);
+	undef($listadd);
+	undef($listdrop);
+	undef($nbiadd);
+	undef($nbidrop);
+	undef($customer);
+	undef($hostupdate);
+	undef($hostdelete);
+	undef($status);
+	undef($backup);
+	undef($restore);
+
+	$start_polling->down(); # wait until reader has started enqueueing
+
+	my $pending = $device_unknown->pending();
+	my $poller;
+	my @pollers;
+	my $poller_limit = int($device_total / 70)+1;
+	my $count;
+	my $device_ref;
+	my @device_info;
+
+	if ($poller_limit > $global_thread_limit) {
+		$poller_limit = $global_thread_limit;
+	}
+	&log_only("Starting (system limited) $poller_limit pollers for $device_total devices.\nPoll may exceed cron interval.");
+
+	# Spin-wait until the reader has enqueued at least one device.
+	# This ensures devices are available before pollers start dequeueing.
+	while ($pending == 0) {
+		$pending = $device_unknown->pending();
+	}
+
+	# Spawn poller threads — each will dequeue and ping devices
+	for (my $count=0; $count < $poller_limit; $count++) {
+		$poller = threads->create(\&poll_slave,$count);
+		push(@pollers,$poller);
+	}
+
+	$stop_polling->down(); # Wait for the database reader to signal that all devices are in queue.
+
+	# Send END sentinel to each poller so they know to stop
+	for (my $count=0; $count < $poller_limit; $count++) {
+		$device_unknown->enqueue('END');
+	}
+
+	# Wait for all pollers to finish
+	foreach my $threads (@pollers) {
+		$threads->join();
+	}
+
+	# Signal the writer that no more results will be produced
+	$device_known->enqueue('END');
+}
+
+# Poller slave
+#
+# Each worker thread runs this function. It dequeues device records from
+# $device_unknown, pings them via ICMP, detects status changes, generates
+# SNMP traps if needed, and enqueues the results into $device_known for
+# the writer to persist.
+#
+# ICMP ping strategy: tries up to 3 times (with increasing timeout on the
+# last attempt) before declaring a device "down". This reduces false
+# positives from transient network blips.
+#
+# Status change detection: compares the current ping result against the
+# last known status. Only transitions (up->down, down->up) trigger traps.
+# Devices that were 'unknown' (never polled before) do not trigger traps
+# on their first poll — they just record their current status.
+sub poll_slave () {
+
+	# Only import the ping and SNMP code to these processes, to reduce memory use
+	require Net::Ping; # allow us to ping devices internally
+	import Net::Ping;
+
+	# Clear option flags in this worker thread
+	undef($add);
+	undef($drop);
+	undef($listadd);
+	undef($listdrop);
+	undef($nbiadd);
+	undef($nbidrop);
+	undef($customer);
+	undef($hostupdate);
+	undef($hostdelete);
+	undef($status);
+	undef($backup);
+	undef($restore);
+	undef($version); # version not needed in worker threads
+
+	my $id = $_[0]; # worker thread ID (for debug output)
+
+	# Create an ICMP ping object with 1-second timeout per attempt.
+	# The 1-second timeout means each ping_slave can spend up to ~4 seconds
+	# per device in the worst case (two 1s attempts + one 2s attempt) before
+	# declaring it down. This worst-case time is the basis for the '70'
+	# divisor in poll_master's thread count calculation, ensuring all
+	# devices are polled within the 5-minute cron interval.
+	my $ping_stat = Net::Ping->new('icmp',1);
+	my $device_ref;
+	my @device_info;
+	my $ret;
+	my $stat;
+	my $curr;
+
+	print("Starting poller #$id.\n") if ($debug);
+
+	while ($device_ref = $device_unknown->dequeue()) {
+
+		# Release the queue slot acquired by the reader — this allows the
+		# reader to enqueue more devices if it was blocked
+		$queue_limit->up();
+
+		last if ($device_ref eq 'END');
+		my ($last_poll, $last_stat, $last_chng, $ip) = @$device_ref;
+		print("Poller #$id: testing: $ip\n") if ($debug);
+
+		# Default to 'down'; only set to 'up' if ping succeeds
+		$stat = 'down';
+
+		# Three-attempt ping: quick retries with progressively longer
+		# timeout on the final attempt (2-second timeout on the third).
+		# This catches transient packet loss that would cause a false
+		# "down" transition.
+		#
+		# Worst-case per-device time: 1s + 1s + 2s = ~4 seconds.
+		# This drives the thread count calculation in poll_master:
+		#   poller_limit = ceil(device_total / 70)
+		# so that 70 devices × 4 seconds = 280 seconds fits within the
+		# 5-minute (300-second) cron interval, even if every device times out.
+		if (my $ret = $ping_stat->ping($ip)) {
+			$stat = 'up';
+		} elsif ($ret = $ping_stat->ping($ip)) {
+			$stat = 'up';
+		} elsif ($ret = $ping_stat->ping($ip,2)) {
+			$stat = 'up';
+		}
+
+		# Timestamp for this poll result
+		$curr = strftime("%F %T", localtime);
+
+		# Check for status transitions and generate traps as needed.
+		# Only actual transitions trigger traps — a device that was 'up'
+		# and is still 'up' does not generate any notification.
+		# Devices with last_stat 'unknown' (never polled before) do not
+		# trigger traps — this prevents a storm of "Node up" traps when
+		# the poller is first initialized.
+		if ($last_stat eq 'up' and $stat eq 'down') {
+			$last_chng = $curr;
+			&send_trap($ip, $stat, $curr);
+			&log_only("Node failure. $ip");
+		} elsif ($last_stat eq 'down' and $stat eq 'up') {
+			$last_chng = $curr;
+			&send_trap($ip, $stat, $curr);
+			&log_only("Node clear. $ip");
+		}
+
+		# Enqueue the result for the writer to persist
+		@device_info=($curr, $stat, $last_chng, $ip);
+		$device_known->enqueue(\@device_info);
+	}
+
+	print("Poller #$id, exiting.\n") if ($debug);
+}
+
+# Subroutine to show help message
+#
+# Displays usage information and the list of supported commands.
+# Called when the user runs with -help or an invalid option, and
+# also when the script aborts because no customer/community is configured.
+sub show_help () {
+	print("
+Network Ping Poller v$version
+
+netpoll [<command> <argument>]
+
+netpoll accepts a single command to perform special operations. Valid commands and their arguments are:
+	-add/drop <IP> - add or drop a single IP from the poll list.
+	-listadd/listdrop <file> - add or drop a list of IPs from a file.
+	-nbiadd/nbidrop <IP> - add or drop a NBI destination.
+	-customer <name> - set the snmp community name for all traps.
+	-hostupdate <name> - update the selected hostname to the current hostname, useful if the host is renamed.
+	-hostdelete <name> - delete the selected hostname entry.
+	-status [<search string>|devices|resend|poller] - perform status checks:
+		: <search string> - check the status of device(s), use '%' as a wildcard instead of '*'.
+		: devices - display the status of all devices, sorted by the last status change date.
+		: resend - resend the current status of all devices via SNMP traps.
+		: poller - display the status of the poller process.
+	-backup <file> - save the poller configuration to a file.
+	-restore <file> - load the poller config from a saved backup. WARNING: this will overwrite the current config!
+
+Execute without a command to perform poll of the IP list.
+
+The poller uses a SQLite database at $db_file for all configuration and runtime
+data. Override the database path with the NETPOLL_DB environment variable.
+");
+}
+
+# This function generates an SNMP trap. It takes three variables:
+#   - the IP of the referenced device
+#   - the device status ('up' or 'down') — determines the OID and message
+#   - the current timestamp (used in the trap message)
+# The trap OID is derived from the status:
+#   - 'down' → linkDown (.1.3.6.1.6.3.1.1.5.3), message: "Node failure"
+#   - 'up' → linkUp (.1.3.6.1.6.3.1.1.5.4), message: "Node clear"
+#
+# SNMP trap format:
+#   snmptrap -v 2c -c <community> <nbi_ip> '' \
+#     <trap_oid> \
+#     .1.1.0 s "<device_ip>" \
+#     .1.2.0 s "<message>" \
+#     .1.10.0 s "netpoll"
+#
+# Uses standard SNMPv2-MIB linkDown/linkUp OIDs. The trap_limit
+# semaphore limits concurrent trap sends to 2.
+sub send_trap () {
+	my $dev = $_[0];
+	my $stat = $_[1];
+	my $curr = $_[2];
+
+	# Determine the trap OID and message from the device status
+	my $trap_oid;
+	my $message;
+	if ($stat eq 'down') {
+		$trap_oid = '.1.3.6.1.6.3.1.1.5.3';  # SNMPv2-MIB linkDown
+		$message = "Node failure. $dev at $curr from $hostname.";
+	} else {
+		$trap_oid = '.1.3.6.1.6.3.1.1.5.4';  # SNMPv2-MIB linkUp
+		$message = "Node clear. $dev at $curr from $hostname.";
+	}
+	my $trap;
+
+	$trap_limit->down(); # grab a snmptrap semaphore
+
+	foreach my $nbi (@NBIS) { # Send a trap to each NBI configured
+		# The snmptrap command, formated for readability
+			$trap = "snmptrap -v 2c -c $CUSTOMER $nbi '' $trap_oid ";
+			$trap .= ".1.1.0 s \"$dev\" ";
+			$trap .= ".1.2.0 s \"$message\" ";
+			$trap .= ".1.10.0 s \"netpoll\"";
+			my $out = `$trap`;
+	
+	}
+
+	$trap_limit->up(); # release the snmptrap semaphore
+}
+
+# This function generates the heartbeat. It sends a warmStart trap to
+# localhost on every poll completion. This allows external monitoring
+# systems to detect when the poller is alive and functioning.
+# Uses standard SNMPv2-MIB warmStart OID (.1.3.6.1.6.3.1.1.5.2).
+sub send_heartbeat () {
+	my $trap;
+	$trap_limit->down(); # grab a snmptrap semaphore
+	$trap = "/usr/bin/snmptrap -v 2c -c $CUSTOMER localhost '' .1.3.6.1.6.3.1.1.5.2 ";
+	$trap .= ".1.2.0 s \"Poller is alive at $finish_time\" ";
+	$trap .= ".1.3.0 s \"$hostname\" ";
+	$trap .= ".1.10.0 s \"netpoll\"";
+	my $out = `$trap`;
+
+	$trap_limit->up(); # release the snmptrap semaphore
+}
+
+# Send message to syslog
+#
+# Logs an informational message to syslog AND prints it to stdout.
+# Uses LOG_USER facility. The $script variable provides the syslog tag.
+sub log_only () {
+	require Sys::Syslog; # allow logging to the syslog
+	import Sys::Syslog;
+
+	# Open the syslog for writing
+	openlog($script, '', 'LOG_USER');
+
+	my $message = $_[0];
+	syslog('LOG_INFO',$message);
+	print("$message\n");
+}
+
+# Send message to syslog and die immediately
+#
+# Logs a warning message to syslog and then exits the thread via
+# threads->exit(). In the main thread this terminates the process;
+# in a worker thread it terminates only that thread.
+# Note: the exit code is 0 even on fatal errors (threads->exit behavior),
+# so critical failures may need separate monitoring.
+sub log_exit () {
+	require Sys::Syslog; # allow logging to the syslog
+	import Sys::Syslog;
+
+	# Open the syslog for writing
+	openlog($script, '', 'LOG_USER');
+
+	my $message = $_[0];
+	syslog('LOG_WARNING',$message);
+	threads->exit($message);
+}
+
+# Command-line option parser
+#
+# Runs as a separate thread so that option parsing doesn't block the main
+# thread. All option variables are shared, so values set here are visible
+# to the main thread after join(). Uses Getopt::Long which is loaded on
+# demand to reduce memory footprint in threads that don't need it.
+sub get_opts () {
+	require Getopt::Long; # command line options handling
+	import Getopt::Long;
+
+	GetOptions(
+		'add=s'			=> \$add,
+		'drop=s'		=> \$drop,
+		'listadd=s'		=> \$listadd,
+		'listdrop=s'	=> \$listdrop,
+		'nbiadd=s'		=> \$nbiadd,
+		'nbidrop=s'		=> \$nbidrop,
+		'customer=s'	=> \$customer,
+		'hostupdate=s'	=> \$hostupdate,
+		'hostdelete=s'	=> \$hostdelete,
+		'status=s'		=> \$status,
+		'backup=s'		=> \$backup,
+		'restore=s'		=> \$restore,
+		) or &show_help();
+}

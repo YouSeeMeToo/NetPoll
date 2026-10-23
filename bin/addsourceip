@@ -1,0 +1,109 @@
+#!/bin/bash
+################################################################################
+#
+# This is designed to be called from snmptrapd
+# Add a line to the snmptrapd.conf file like this:
+# 	traphandle default /usr/local/sbin/addsourceip
+#
+#		v 1.0	2012-06-01	Ulysses Cruz
+#		v 1.1	2012-06-14	Ulysses Cruz	Added NBI configuration into db.
+#		v 2.0	2012-06-19	Ulysses Cruz	Updated to use new config database format
+#		v 3.0	2026-10-22	Ulysses Cruz	Ported from MySQL to SQLite for portability.
+#
+# �2012-2026 Ulysses Cruz
+################################################################################
+
+# the hostname and ip are the first two lines on STDIN
+read host
+read source_ip
+ip=$(echo $source_ip | grep -o "[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}" | head -n 1)
+
+# get the community string from the netpoll database
+host=$( hostname )
+ver='3.0'
+script=$(basename "$0")
+
+# Set the SQLite database file path (override with NETPOLL_DB environment variable)
+DB_FILE="${NETPOLL_DB:-/var/lib/netpoll/netpoll.db}"
+
+# Function to run a query against the SQLite database
+MyCMD() {
+	sqlite3 "$DB_FILE" "$1"
+}
+
+#
+# Functions
+#
+
+# This function logs an error message to syslog, then exits
+log_exit () {
+	logger -t $script "$1"
+	exit 1
+}
+
+# This function just logs an error to syslog, without exiting
+log_only () {
+	logger -t $script "$1"
+}
+
+#
+# Main script
+#
+
+# Make sure the database file exists
+if [ ! -f "$DB_FILE" ]; then
+	log_exit "Database file not found: $DB_FILE. Has netpoll been initialized?"
+fi
+
+# Test database accessibility
+sqlite3 "$DB_FILE" "select 1" > /dev/null 2>&1
+[ $? -eq 0 ] && status="Success!" || log_exit "Failed to connect to SQLite database: $DB_FILE"
+
+if [ "$ip" == '127.0.0.1' ] # Heartbeat from local netpoll
+then
+	ip=$host
+fi
+
+CUSTOMER=$(MyCMD "select customer from script where server='$host'" 2> /dev/null)
+
+NBIS=( $(MyCMD "select ip from nbis_$host" 2> /dev/null) )
+
+if [ "$CUSTOMER" == 'changeme' ] # Make sure a customer name is set
+then
+	echo "Customer name not set. Please set with command: 'netpoll customer <name>'"
+elif [ "$CUSTOMER" == '' ]
+then
+	echo "Customer name not set. Please set with command: 'netpoll customer <name>'"
+elif [[ $(MyCMD "select count(*) from nbis_$host") = 0 ]] # Make sure NBIs are configured
+then
+	echo "No NBIs set. Please set with command: 'netpoll nbiadd <IP>'"
+else # Run conditions are met, forward trap.
+	count=0
+	declare -a oids
+	declare -a vars
+
+	# read incoming oid and value pairs from STDIN
+	while read oid val
+	do
+		(( ++count ))
+		oids[count]="$oid"
+		vals[count]="$val"
+	done
+
+	for nbi in ${NBIS[@]}
+	do
+		# set the first part of the snmptrap command
+		command="snmptrap -v 2c -c $CUSTOMER $nbi ''"
+		# insert the source IP as the first OID variable
+		command="$command ${vals[2]} .1.1.0 s \"$ip\""
+		# build the rest of the command command
+		for (( i=3; i<=$count; i++ ))
+		do
+			let j=i-1
+			command="$command .1.$j.0 s ${vals[i]}"
+		done
+
+		# Execute the snmptrap command
+		eval $command || log_only "Trap send failed: $command"
+	done
+fi

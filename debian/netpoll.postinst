@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create the database directory
+        if [ ! -d /var/lib/netpoll ]; then
+            mkdir -p /var/lib/netpoll
+            chmod 755 /var/lib/netpoll
+        fi
+
+        # Create an empty database by initializing via the poller
+        # (the first run with -customer will create the tables)
+        if [ ! -f /var/lib/netpoll/netpoll.db ]; then
+            NETPOLL_DB=/var/lib/netpoll/netpoll.db /usr/sbin/netpoll customer changeme \
+                2>/dev/null || true
+        fi
+
+        # Note: snmptrapd configuration must be set up manually.
+        # An example traphandle config is installed at:
+        #   /usr/share/doc/netpoll/examples/snmptrapd.conf.example
+        echo "NetPoll installed. Configure snmptrapd and set the customer"
+        echo "community string with: netpoll -customer <name>"
+    ;;
+    abort-upgrade|abort-rollback|abort-remove)
+    ;;
+esac
+
+exit 0

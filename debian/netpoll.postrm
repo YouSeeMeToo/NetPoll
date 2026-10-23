@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove the database directory on purge
+        if [ -d /var/lib/netpoll ]; then
+            rm -rf /var/lib/netpoll
+        fi
+    ;;
+esac
+
+exit 0

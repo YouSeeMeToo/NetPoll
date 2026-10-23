@@ -1,0 +1,3 @@
+# NetPoll cron entry
+# Run the poller every 5 minutes (standard interval).
+*/5 * * * * root /usr/sbin/netpoll

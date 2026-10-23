@@ -1,0 +1,2 @@
+bin/netpoll /usr/sbin/
+bin/addsourceip /usr/sbin/

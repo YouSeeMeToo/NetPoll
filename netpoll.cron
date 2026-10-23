@@ -1,0 +1,7 @@
+# NetPoll cron entry
+#
+# Run the poller every 5 minutes (standard interval).
+# Replace /usr/local/sbin/netpoll with the actual path to bin/netpoll.
+#
+# m h  dom mon dow   command
+*/5 * * * * /usr/local/sbin/netpoll

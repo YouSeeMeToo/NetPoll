@@ -1,0 +1,25 @@
+contributing:
+  - text eol=lf
+
+# Ensure scripts have LF line endings on all platforms
+*.sh                        text eol=lf
+bin/netpoll                 text eol=lf
+bin/addsourceip             text eol=lf
+netpoll.cron                text eol=lf
+Makefile                    text eol=lf
+
+# Documentation
+*.md                        text eol=lf
+
+# SQL files
+*.sql                       text eol=lf
+
+# Debian packaging
+debian/*                    text eol=lf
+debian/source/format        text eol=lf
+
+# RPM spec
+*.spec                      text eol=lf
+
+# Exclude build artifacts from version control
+netpoll-4.0-standalone.tar.gz binary

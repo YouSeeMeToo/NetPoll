@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Verify Perl syntax
+	perl -c $(CURDIR)/bin/netpoll
+	# Verify Bash syntax
+	bash -n $(CURDIR)/bin/addsourceip
+
+override_dh_install:
+	dh_install
+	# Install cron file to /etc/cron.d/netpoll (dh_install creates
+	# a subdirectory when dest looks like a dir, so we do it manually)
+	mkdir -p debian/netpoll/etc/cron.d
+	install -m 644 debian/netpoll.cron debian/netpoll/etc/cron.d/netpoll

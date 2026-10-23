@@ -1,0 +1,37 @@
+Source: netpoll
+Section: net/monitoring
+Priority: optional
+Maintainer: Ulysses Cruz <ulyssecruz@example.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: <https://github.com/ulyssecruz/NetPoll>
+
+Package: netpoll
+Architecture: all
+Depends:
+  ${misc:Depends},
+  perl (>= 5.26),
+  libdbi-perl,
+  libdbd-sqlite3-perl,
+  libsys-syslog-perl,
+  sqlite3
+Description: Network Ping Poller with SNMP trap generation
+ NetPoll pings a large number of IPs in a set time interval and generates
+ SNMP traps when the up/down status of an IP changes. All configuration
+ and runtime data is stored in a SQLite database — no external database
+ server required.
+ .
+ The script is designed to run from cron every 5 minutes. It uses Perl
+ ithreads for parallel ICMP polling, SQLite WAL mode for concurrent
+ database access, and standard SNMPv2-MIB OIDs (linkDown/linkUp) for
+ vendor-neutral trap reception.
+ .
+ Integration with snmptrapd is handled by the companion addsourceip
+ trap handler, which forwards and re-indexes incoming traps to configured
+ NBI destinations.
+Features:
+  * Parallel ICMP polling using Perl ithreads
+  * SQLite database (zero external server dependencies)
+  * SNMP traps for device status changes (linkDown/linkUp, warmStart)
+  * Per-host table naming for multi-host shared database support
+  * snmptrapd integration via addsourceip trap handler

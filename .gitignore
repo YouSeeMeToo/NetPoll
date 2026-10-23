@@ -1,0 +1,44 @@
+# Perl
+*.bak
+*.old
+*~
+__pycache__/
+*.swp
+*.swo
+
+# NetPoll runtime
+*.lock
+*.pid
+/var/lock/netpoll_*
+
+# Backups
+*.sql
+*.dump
+!sql/schema.sql
+backup/
+backups/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Standalone build artifacts
+/netpoll
+netpoll-*-standalone.tar.gz
+netpoll-*/
+
+# Build output directory
+packages/
+
+# Debhelper build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper.log
+debian/*.substvars
+debian/netpoll/
+
